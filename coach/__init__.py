@@ -1,0 +1,1 @@
+"""Local cycling coach application."""

@@ -1,0 +1,18 @@
+[project]
+name = "cycling-coach"
+version = "0.1.0"
+description = "A local cycling training planner"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.1,<4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

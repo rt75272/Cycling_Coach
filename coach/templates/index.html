@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ridewise | Cycling Coach</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="/">RIDE<span>WISE</span><small> / CYCLING COACH</small></a>
+      <nav aria-label="Main navigation">
+        <a href="#profile">Profile</a><a href="#zones">Power zones</a><a href="#events">Events</a><a href="#calendar">Calendar</a><a href="#rides">Ride log</a>
+      </nav>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">YOUR LOCAL TRAINING COMPANION</p>
+        <h1>Ride with <em>purpose.</em></h1>
+        <p>Know your zones, track your rides, and build a simple plan for the start line.</p>
+        <a class="button" href="#profile">Set up your profile <span>↗</span></a>
+      </div>
+      <div class="hero-card">
+        <span class="hero-label">YOUR TRAINING SNAPSHOT</span>
+        <div class="hero-stat"><strong>{{ profile.ftp if profile else '—' }}</strong><span>W<br>FTP{% if profile and profile.ftp_source.startswith('Estimated') %} EST.{% endif %}</span></div>
+        <div class="hero-divider"></div>
+        <div class="hero-meta"><span>{{ events|length }} <small>EVENTS</small></span><span>{{ rides|length }} <small>RIDES</small></span><span>{{ profile.hours_per_week if profile else '—' }} <small>HRS / WK</small></span></div>
+      </div>
+    </section>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="notice {{ category }}" role="status">{{ message }}</div>{% endfor %}
+    {% endwith %}
+    <div class="safety"><strong>Ride within your limits.</strong> This is a general starting point, not medical or professional coaching advice. Adjust for experience, recovery and health; seek qualified advice when needed.</div>
+
+    <section id="profile" class="section">
+      <div class="section-heading"><div><p class="eyebrow">01 / THE RIDER</p><h2>Your profile</h2></div><p>Tell us the basics. Your information stays on this computer.</p></div>
+      <div class="panel">
+        <form action="{{ url_for('save_profile') }}" method="post" id="profile-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="setup-progress" hidden>
+            <div class="progress-label"><span>YOUR RIDER SETUP</span><strong id="step-label">Step 1 of 3</strong></div>
+            <div class="progress-track" role="progressbar" aria-label="Profile setup progress" aria-valuemin="1" aria-valuemax="3" aria-valuenow="1"><span></span></div>
+            <div class="progress-steps" aria-hidden="true"><span>THE BASICS</span><span>YOUR POWER</span><span>READY TO RIDE</span></div>
+          </div>
+          <section class="setup-step" data-step>
+            <p class="step-kicker">LET'S GET TO KNOW YOU</p>
+            <h3 tabindex="-1">First, the basics.</h3>
+            <p class="step-intro">A few details help make your dashboard yours. You can update these anytime.</p>
+            <div class="form-grid">
+              <label>Height <span>cm</span><input type="number" name="height_cm" min="50" max="250" step="any" value="{{ profile.height_cm if profile else '' }}" placeholder="175"></label>
+              <label>OR height <span>feet</span><input type="number" name="height_ft" min="1" max="8" step="1" placeholder="5"></label>
+              <label>Height <span>inches</span><input type="number" name="height_in" min="0" max="12" step="any" placeholder="9"></label>
+              <label>Weight <span>kg</span><input type="number" name="weight_kg" min="20" max="350" step="any" value="{{ profile.weight_kg if profile else '' }}" placeholder="70"></label>
+              <label>OR weight <span>lb</span><input type="number" name="weight_lb" min="0.01" max="1000" step="any" placeholder="154"></label>
+              <label>Weekly riding time <span>hours</span><input type="number" name="hours_per_week" min="1" max="30" step="0.5" required value="{{ profile.hours_per_week if profile else '' }}" placeholder="6"></label>
+            </div>
+            <p class="hint">Enter height in cm or feet and inches. Feet take precedence over cm; inches are optional and must be less than 12. Height is saved in cm, rounded to two decimal places (50–250 cm).</p>
+            <p class="live-tip" id="height-preview" hidden aria-live="polite"></p>
+            <p class="hint">Enter weight in kg or lb. If both are provided, lb takes precedence; it is converted to kg and rounded to two decimal places. Accepted weights are 20–350 kg after conversion.</p>
+            <p class="live-tip" id="weight-preview" hidden aria-live="polite"></p>
+          </section>
+          <section class="setup-step" data-step>
+            <p class="step-kicker">FIND YOUR RHYTHM</p>
+            <h3 tabindex="-1">Let's talk power.</h3>
+            <p class="step-intro">Your threshold helps translate effort into personal training zones.</p>
+            <div class="form-grid">
+              <label>Functional threshold power <span>watts</span><input type="number" name="ftp" min="50" max="1000" step="1" value="{{ profile.ftp if profile and profile.ftp_source == 'FTP entered directly' else '' }}" placeholder="e.g. 220"></label>
+              <label>OR representative zone 2 power <span>watts</span><input type="number" name="zone2" min="33" max="655" step="1" value="{{ profile.zone2 if profile and profile.zone2 is not none else '' }}" placeholder="e.g. 145"></label>
+            </div>
+            <p class="hint">Enter FTP or a typical zone 2 wattage. If both are provided, FTP takes precedence. Zone 2 is assumed to be the midpoint (65.5%) of FTP, so the resulting FTP is only an estimate.</p>
+            <p class="live-tip" id="power-preview" hidden aria-live="polite"></p>
+          </section>
+          <section class="setup-step setup-review" data-step hidden>
+            <p class="step-kicker">LOOKING GOOD</p>
+            <h3 tabindex="-1">Ready for the road?</h3>
+            <p class="step-intro">Here's your starting line. Save your profile to calculate your zones.</p>
+            <div class="review-grid" id="profile-review"></div>
+            <p class="hint">Your plan is a starting point, not a substitute for professional advice. Listen to your body and adjust when needed.</p>
+          </section>
+          <div class="setup-actions">
+            <button type="button" class="secondary setup-back" hidden>← Back</button>
+            <button type="button" class="setup-next" hidden>Next step <span>↗</span></button>
+            <button type="submit" class="setup-save">Save profile <span>↗</span></button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="zones" class="section">
+      <div class="section-heading"><div><p class="eyebrow">02 / KNOW YOUR EFFORT</p><h2>Power zones</h2></div><p>Seven practical zones, calculated from your threshold.</p></div>
+      <div class="panel">
+        {% if profile %}
+          <div class="zone-summary"><strong>{{ profile.ftp }} W FTP</strong><span>{{ profile.ftp_source }} · {{ "%.2f"|format(profile.ftp / profile.weight_kg) }} W/kg</span></div>
+          <div class="zone-list">
+            {% for zone in zones %}<div class="zone-row"><span class="zone-num">0{{ zone.number }}</span><strong>{{ zone.name }}</strong><span>{{ zone.minimum }}{% if zone.maximum is not none %}–{{ zone.maximum }}{% else %}+{% endif %} W</span></div>{% endfor %}
+          </div>
+          <p class="hint">Based on conventional FTP percentage bands, rounded to whole watts. Zone 7 has no upper limit. Actual zones vary by rider and testing method.</p>
+        {% else %}<p class="empty">Save your profile to see your power zones.</p>{% endif %}
+      </div>
+    </section>
+
+    <section id="events" class="section">
+      <div class="section-heading"><div><p class="eyebrow">03 / THE GOAL</p><h2>Events &amp; races</h2></div><p>Give your training a finish line.</p></div>
+      <div class="two-col">
+        <div class="panel">
+          <h3>Add an event</h3>
+          <form action="{{ url_for('add_event') }}" method="post" id="event-form" data-today="{{ today }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Event name<input name="name" maxlength="200" required placeholder="Your next big ride"></label>
+            <div class="form-grid compact">
+              <label>Event date<input type="date" name="event_date" required></label>
+              <label>Distance <span>km · optional</span><input type="number" name="distance_km" min="0.1" max="1000" step="0.1" placeholder="100"></label>
+            </div>
+            <label>Details <span>optional</span><textarea name="details" maxlength="2000" rows="3" placeholder="Terrain, location, or other notes"></textarea></label>
+            <p class="live-tip" id="event-preview" hidden aria-live="polite"></p>
+            <button type="submit">Add event <span>↗</span></button>
+          </form>
+        </div>
+        <div class="panel">
+          <h3>On the horizon</h3>
+          {% for event in events %}
+            <article class="entry">
+              <div class="entry-top"><span class="tag">{{ event.event_date }}</span>{% if event.distance_km %}<span class="muted">{{ event.distance_km }} km</span>{% endif %}</div>
+              <h4>{{ event.name }}</h4>
+              {% if event.details %}<p class="preline">{{ event.details }}</p>{% endif %}
+              {% if event.event_date > today %}
+              <form action="{{ url_for('generate_plan', event_id=event.id) }}" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="secondary" type="submit">Generate / refresh plan</button>
+              </form>
+              {% else %}<span class="muted">Past event</span>{% endif %}
+            </article>
+          {% else %}<p class="empty">No events yet. Add one to make a plan.</p>{% endfor %}
+          <p class="hint">Plans cover up to 8 weeks, on Tuesday, Thursday and Saturday. Refreshing replaces this event's future generated planned rides, but keeps completed and manually entered rides. Multiple event plans can overlap; review the combined schedule.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="rides" class="section">
+      <div class="section-heading"><div><p class="eyebrow">04 / THE JOURNEY</p><h2>Ride log</h2></div><p>Log your efforts and keep track of the journey.</p></div>
+      <div class="two-col">
+        <div class="panel">
+          <h3>Log a ride</h3>
+          <form action="{{ url_for('add_ride') }}" method="post" id="ride-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Ride name<input name="title" maxlength="200" required placeholder="Morning endurance"></label>
+            <div class="form-grid compact">
+              <label>Date<input type="date" name="ride_date" required value="{{ today }}"></label>
+              <label>Status<select name="status"><option value="completed">Completed</option><option value="planned">Planned</option></select></label>
+              <label>Duration <span>minutes</span><input type="number" name="duration_minutes" min="1" max="1440" required placeholder="60"></label>
+              <label>Power zone <span>optional</span><input name="zone" maxlength="100" placeholder="Zone 2"></label>
+            </div>
+            <div class="quick-durations" hidden><span>QUICK DURATION</span><button type="button" data-duration="30">30 min</button><button type="button" data-duration="60">60 min</button><button type="button" data-duration="90">90 min</button></div>
+            <label>Notes <span>optional</span><textarea name="notes" maxlength="2000" rows="3" placeholder="How did it feel?"></textarea></label>
+            <p class="live-tip" id="ride-preview" hidden aria-live="polite"></p>
+            <button type="submit">Add ride <span>↗</span></button>
+          </form>
+        </div>
+        <div class="panel">
+          <h3>Past rides</h3>
+          {% for ride in past_rides %}
+            <article class="entry">
+              <div class="entry-top"><span class="tag">{{ ride.ride_date }}</span><span class="status {{ ride.status }}">{{ ride.status }}</span></div>
+              <h4>{{ ride.title }}</h4>
+              <p>{{ ride.duration_minutes }} min{% if ride.zone %} · {{ ride.zone }}{% endif %}{% if ride.event_name %} · {{ ride.event_name }}{% endif %}</p>
+              {% if ride.notes %}<p class="preline">{{ ride.notes }}</p>{% endif %}
+              {% if ride.status == 'planned' %}
+              <form action="{{ url_for('complete_ride', ride_id=ride.id) }}" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="secondary" type="submit">Mark completed</button>
+              </form>{% endif %}
+            </article>
+          {% else %}<p class="empty">No past rides yet. Your calendar shows today's and upcoming rides.</p>{% endfor %}
+        </div>
+      </div>
+    </section>
+    <section id="calendar" class="section">
+      <div class="section-heading"><div><p class="eyebrow">05 / YOUR ROAD AHEAD</p><h2>Training calendar</h2></div><p>Every session and event, one month at a time.</p></div>
+      <div class="panel calendar-panel">
+        <div class="calendar-heading">
+          <div><p class="step-kicker">PLAN YOUR NEXT RIDE</p><h3 id="calendar-month">{{ month_title }}</h3></div>
+          <nav class="calendar-nav" aria-label="Calendar months">
+            {% if previous_month %}<a href="{{ url_for('index', month=previous_month) }}#calendar" aria-label="Previous month">← Previous</a>{% endif %}
+            <a href="{{ url_for('index', month=current_month) }}#calendar">Today</a>
+            {% if next_month %}<a href="{{ url_for('index', month=next_month) }}#calendar" aria-label="Next month">Next →</a>{% endif %}
+          </nav>
+        </div>
+        <p class="hint">Select a ride to see its details or mark it complete. Scroll sideways on small screens.</p>
+        <div class="calendar-scroll" role="region" aria-label="Monthly training calendar" tabindex="0">
+          <table class="calendar" aria-labelledby="calendar-month">
+            <thead><tr>{% for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] %}<th scope="col" aria-label="{{ day }}">{{ day[:3] }}</th>{% endfor %}</tr></thead>
+            <tbody>
+              {% for week in weeks %}<tr>
+                {% for day in week %}
+                  {% if day %}
+                  <td data-date="{{ day.date }}"{% if day.date == today %} class="calendar-today"{% endif %}>
+                    <span class="calendar-day"{% if day.date == today %} aria-current="date"{% endif %}>{{ day.day }}</span>
+                    {% for event in day.events %}
+                    <div class="calendar-event"><span>EVENT</span><strong>{{ event.name }}</strong>{% if event.distance_km %}<small>{{ event.distance_km }} km</small>{% endif %}</div>
+                    {% endfor %}
+                    {% for ride in day.rides %}
+                    <details class="calendar-ride {{ ride.status }}" data-ride-id="{{ ride.id }}">
+                      <summary><span class="calendar-ride-status">{{ ride.status }}</span><strong>{{ ride.title }}</strong><small>{{ ride.duration_minutes }} min{% if ride.zone %} · {{ ride.zone }}{% endif %}</small></summary>
+                      {% if ride.event_name %}<p>For {{ ride.event_name }}</p>{% endif %}
+                      {% if ride.notes %}<p class="preline">{{ ride.notes }}</p>{% endif %}
+                      {% if ride.status == 'planned' %}
+                      <form action="{{ url_for('complete_ride', ride_id=ride.id) }}" method="post">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button class="secondary" type="submit">Mark completed</button>
+                      </form>{% endif %}
+                    </details>
+                    {% endfor %}
+                  </td>
+                  {% else %}<td class="calendar-blank"></td>{% endif %}
+                {% endfor %}
+              </tr>{% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+  <footer class="wrap">RIDEWISE <span>·</span> BUILT FOR THE LONG RIDE</footer>
+</body>
+</html>
