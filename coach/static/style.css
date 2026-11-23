@@ -66,6 +66,14 @@ textarea { resize: vertical; }
 .preline { white-space: pre-line; overflow-wrap: anywhere; }
 .secondary { background: #f0f5e9; margin-top: 10px; padding: 9px 12px; }
 .empty { color: var(--muted); }
+.checkin-form { display: flex; gap: 16px; align-items: end; flex-wrap: wrap; margin-bottom: 16px; }
+.checkin-form label { min-width: 230px; flex: 1; margin: 0; }
+.plan-explanation { background: #f1f7e9; padding: 10px 12px; }
+.ride-feedback { margin-top: 12px; }
+.ride-feedback label { margin-bottom: 10px; }
+.ride-feedback input, .ride-feedback select { min-width: 0; padding: 7px; }
+.feedback-details { margin-top: 10px; }
+.feedback-details > summary { cursor: pointer; font-weight: 700; font-size: 12px; }
 .setup-progress { margin-bottom: 32px; }
 .progress-label { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; letter-spacing: 1.2px; color: #647a59; }
 .progress-label strong { color: var(--ink); letter-spacing: 0; }

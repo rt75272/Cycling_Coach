@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+import sqlite3
 
 import pytest
 
@@ -166,6 +167,126 @@ def test_calendar_shows_overlapping_rides_and_event_on_same_day(client, app):
     cell = page.split('data-date="2032-02-29"', 1)[1].split("</td>", 1)[0]
     assert all(value in cell for value in ("Race day", "Morning", "Evening"))
     assert cell.count('class="calendar-ride planned"') == 2
+
+
+def test_feedback_automatically_replans_and_unwell_pauses_without_losing_rides(client, app):
+    today = date.today()
+    post(client, "/profile", height_cm="175", weight_kg="70", hours_per_week="6", ftp="200")
+    post(client, "/events", name="Race", event_date=(today + timedelta(days=50)).isoformat())
+    post(client, "/events/1/plan")
+    response = post(client, "/rides", ride_date=(today - timedelta(days=1)).isoformat(), title="Hard ride",
+                    status="completed", duration_minutes="120", feeling="poor", effort="9", performance="worse")
+    assert b"Active event plans updated" in response.data
+    with app.app_context():
+        db = get_db()
+        assert db.execute("SELECT actual_minutes FROM ride_feedback").fetchone()[0] == 120
+        assert "Recovery:" in db.execute("SELECT explanation FROM active_plans").fetchone()[0]
+        sessions = db.execute("SELECT * FROM rides WHERE generated=1 AND status='planned'").fetchall()
+        assert sessions and all("Tempo" not in ride["title"] for ride in sessions)
+    post(client, "/rides", ride_date=(today + timedelta(days=10)).isoformat(), title="Manual future",
+         status="planned", duration_minutes="60")
+    response = post(client, "/checkin", readiness="unwell")
+    assert b"Training is paused" in response.data
+    with app.app_context():
+        db = get_db()
+        assert db.execute("SELECT COUNT(*) FROM rides WHERE generated=1 AND status='planned'").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM rides WHERE title IN ('Hard ride', 'Manual future')").fetchone()[0] == 2
+        assert "Training paused" in db.execute("SELECT explanation FROM active_plans").fetchone()[0]
+    post(client, "/checkin", readiness="good")
+    with app.app_context():
+        db = get_db()
+        assert "Recovery:" in db.execute("SELECT explanation FROM active_plans").fetchone()[0]
+        assert db.execute("SELECT COUNT(*) FROM rides WHERE generated=1 AND status='planned'").fetchone()[0] > 0
+
+
+def test_actual_feedback_is_editable_and_invalid_inputs_do_not_mutate(client, app):
+    today = date.today()
+    post(client, "/rides", ride_date=today.isoformat(), title="Ride", status="completed",
+         duration_minutes="60")
+    response = post(client, "/rides/1/feedback", actual_minutes="45", effort="7",
+                    feeling="okay", performance="same")
+    assert b"Feedback saved." in response.data
+    with app.app_context():
+        row = get_db().execute("SELECT * FROM ride_feedback").fetchone()
+        assert (row["actual_minutes"], row["effort"], row["feeling"]) == (45, 7, "okay")
+    response = post(client, "/rides/1/feedback", actual_minutes="50", effort="11",
+                    feeling="good", performance="same")
+    assert b"Effort must be between" in response.data
+    with app.app_context():
+        assert get_db().execute("SELECT actual_minutes FROM ride_feedback").fetchone()[0] == 45
+    assert client.post("/checkin", data={}).status_code == 400
+    response = post(client, "/checkin", readiness="invalid")
+    assert b"Choose how you are feeling" in response.data
+
+
+def test_active_plans_share_budget_and_reserve_manual_rides(client, app):
+    today = date.today()
+    post(client, "/profile", height_cm="175", weight_kg="70", hours_per_week="6", ftp="200")
+    for name in ("First", "Second"):
+        post(client, "/events", name=name, event_date=(today + timedelta(days=50)).isoformat())
+    post(client, "/events/1/plan")
+    post(client, "/events/2/plan")
+    next_monday = today + timedelta(days=7 - today.weekday())
+    post(client, "/rides", ride_date=next_monday.isoformat(), title="Manual",
+         status="planned", duration_minutes="120")
+    with app.app_context():
+        db = get_db()
+        rides = db.execute("SELECT ride_date, duration_minutes FROM rides WHERE status='planned'").fetchall()
+        totals = {}
+        for ride in rides:
+            week = date.fromisoformat(ride["ride_date"]).isocalendar()[:2]
+            totals[week] = totals.get(week, 0) + ride["duration_minutes"]
+        assert all(total <= 360 for total in totals.values())
+        assert db.execute("SELECT COUNT(*) FROM active_plans WHERE explanation LIKE '%shared%'").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM rides WHERE title='Manual'").fetchone()[0] == 1
+
+
+def test_positive_recent_feedback_then_poor_feedback_changes_active_plan(client, app):
+    today = date.today()
+    post(client, "/profile", height_cm="175", weight_kg="70", hours_per_week="8", ftp="200")
+    for days in (1, 3, 8, 10):
+        post(client, "/rides", ride_date=(today - timedelta(days=days)).isoformat(), title=f"Ride {days}",
+             status="completed", duration_minutes="150", feeling="good", effort="5", performance="same")
+    post(client, "/checkin", readiness="good")
+    post(client, "/events", name="Race", event_date=(today + timedelta(days=50)).isoformat())
+    post(client, "/events/1/plan")
+    with app.app_context():
+        db = get_db()
+        assert "Progression:" in db.execute("SELECT explanation FROM active_plans").fetchone()[0]
+        weekly = {}
+        for row in db.execute("SELECT ride_date, duration_minutes FROM rides WHERE generated=1 AND status='planned'"):
+            week = date.fromisoformat(row["ride_date"]).isocalendar()[:2]
+            weekly[week] = weekly.get(week, 0) + row["duration_minutes"]
+        assert weekly and all(minutes <= 315 for minutes in weekly.values())
+        recent_id = db.execute("SELECT id FROM rides WHERE title='Ride 1'").fetchone()[0]
+    post(client, f"/rides/{recent_id}/feedback", actual_minutes="150",
+         feeling="poor", effort="9", performance="worse")
+    with app.app_context():
+        db = get_db()
+        assert "Recovery:" in db.execute("SELECT explanation FROM active_plans").fetchone()[0]
+        planned = db.execute("SELECT title FROM rides WHERE generated=1 AND status='planned'").fetchall()
+        assert planned and all("Tempo" not in ride["title"] for ride in planned)
+
+
+def test_existing_database_is_migrated_without_treating_plans_as_actual(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+            CREATE TABLE events (id INTEGER PRIMARY KEY, name TEXT NOT NULL, event_date TEXT NOT NULL,
+                distance_km REAL, details TEXT NOT NULL DEFAULT '');
+            CREATE TABLE rides (id INTEGER PRIMARY KEY, ride_date TEXT NOT NULL, title TEXT NOT NULL,
+                status TEXT NOT NULL, duration_minutes INTEGER NOT NULL, zone TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '', event_id INTEGER REFERENCES events(id), generated INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO events (id, name, event_date) VALUES (1, 'Race', '2099-12-01');
+            INSERT INTO rides (id, ride_date, title, status, duration_minutes, event_id, generated)
+                VALUES (1, '2099-11-01', 'Original', 'planned', 60, 1, 1);
+        """)
+    app = create_app({"TESTING": True, "DATABASE": str(path), "SECRET_KEY": "test"})
+    with app.app_context():
+        db = get_db()
+        assert db.execute("SELECT title FROM rides WHERE id=1").fetchone()[0] == "Original"
+        assert db.execute("SELECT event_id FROM active_plans").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM ride_feedback").fetchone()[0] == 0
 
 
 def test_validation_and_form_token(client, app):

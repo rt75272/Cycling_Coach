@@ -50,5 +50,23 @@ def init_db() -> None:
             event_id INTEGER REFERENCES events(id) ON DELETE SET NULL,
             generated INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS ride_feedback (
+            ride_id INTEGER PRIMARY KEY REFERENCES rides(id) ON DELETE CASCADE,
+            actual_minutes INTEGER NOT NULL CHECK (actual_minutes BETWEEN 1 AND 1440),
+            feeling TEXT CHECK (feeling IN ('good', 'okay', 'poor')),
+            effort INTEGER CHECK (effort BETWEEN 1 AND 10),
+            performance TEXT CHECK (performance IN ('better', 'same', 'worse'))
+        );
+        CREATE TABLE IF NOT EXISTS checkins (
+            checkin_date TEXT PRIMARY KEY,
+            feeling TEXT NOT NULL CHECK (feeling IN ('good', 'okay', 'tired', 'unwell'))
+        );
+        CREATE TABLE IF NOT EXISTS active_plans (
+            event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+            explanation TEXT NOT NULL DEFAULT '',
+            updated_on TEXT NOT NULL DEFAULT ''
+        );
+        INSERT OR IGNORE INTO active_plans (event_id)
+        SELECT DISTINCT event_id FROM rides WHERE generated = 1 AND event_id IS NOT NULL;
     """)
     get_db().commit()

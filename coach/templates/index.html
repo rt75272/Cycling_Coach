@@ -37,6 +37,27 @@
     {% endwith %}
     <div class="safety"><strong>Ride within your limits.</strong> This is a general starting point, not medical or professional coaching advice. Adjust for experience, recovery and health; seek qualified advice when needed.</div>
 
+    <section id="checkin" class="section">
+      <div class="section-heading"><div><p class="eyebrow">YOUR DAILY CHECK-IN</p><h2>How are you feeling?</h2></div><p>Check in and your active event plans update automatically.</p></div>
+      <div class="panel">
+        <form action="{{ url_for('save_checkin') }}" method="post" class="checkin-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>Today
+            <select name="readiness" required>
+              <option value="">Choose how you feel</option>
+              <option value="good">Good and recovered</option>
+              <option value="okay">Okay</option>
+              <option value="tired">Tired or fatigued</option>
+              <option value="unwell">Unwell or injured — pause training</option>
+            </select>
+          </label>
+          <button type="submit">Save check-in</button>
+        </form>
+        {% if checkin %}<p class="hint">Latest check-in: {{ checkin.checkin_date }} · {{ {'good':'Good and recovered', 'okay':'Okay', 'tired':'Tired or fatigued', 'unwell':'Unwell or injured'}[checkin.feeling] }}.</p>{% endif %}
+        <p class="hint">If you are unwell or injured, stop exercising and seek appropriate medical advice. Training stays paused until you update your check-in.</p>
+      </div>
+    </section>
+
     <section id="profile" class="section">
       <div class="section-heading"><div><p class="eyebrow">01 / THE RIDER</p><h2>Your profile</h2></div><p>Tell us the basics. Your information stays on this computer.</p></div>
       <div class="panel">
@@ -128,6 +149,7 @@
               <div class="entry-top"><span class="tag">{{ event.event_date }}</span>{% if event.distance_km %}<span class="muted">{{ event.distance_km }} km</span>{% endif %}</div>
               <h4>{{ event.name }}</h4>
               {% if event.details %}<p class="preline">{{ event.details }}</p>{% endif %}
+              {% if event.plan_explanation %}<p class="plan-explanation">Updated {{ event.plan_updated_on }}. {{ event.plan_explanation }}</p>{% endif %}
               {% if event.event_date > today %}
               <form action="{{ url_for('generate_plan', event_id=event.id) }}" method="post">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -136,10 +158,48 @@
               {% else %}<span class="muted">Past event</span>{% endif %}
             </article>
           {% else %}<p class="empty">No events yet. Add one to make a plan.</p>{% endfor %}
-          <p class="hint">Plans cover up to 8 weeks, on Tuesday, Thursday and Saturday. Refreshing replaces this event's future generated planned rides, but keeps completed and manually entered rides. Multiple event plans can overlap; review the combined schedule.</p>
+          <p class="hint">Plans cover up to 8 weeks. Check-ins and actual ride feedback automatically refresh active event plans; completed and manually entered rides are kept. Review the combined schedule, especially if your log is incomplete.</p>
         </div>
       </div>
     </section>
+
+    {% macro rating_fields(ride=none) %}
+      <label>How did you feel? <span>optional</span><select name="feeling">
+        <option value="">Not recorded</option>
+        <option value="good"{% if ride and ride.feeling == 'good' %} selected{% endif %}>Good</option>
+        <option value="okay"{% if ride and ride.feeling == 'okay' %} selected{% endif %}>Okay</option>
+        <option value="poor"{% if ride and ride.feeling == 'poor' %} selected{% endif %}>Poor / fatigued</option>
+      </select></label>
+      <label>Effort <span>1 easy – 10 maximal · optional</span><input type="number" name="effort" min="1" max="10" step="1" value="{{ ride.effort if ride and ride.effort is not none else '' }}"></label>
+      <label>Performance compared with similar rides <span>optional</span><select name="performance">
+        <option value="">Not recorded</option>
+        <option value="better"{% if ride and ride.performance == 'better' %} selected{% endif %}>Better</option>
+        <option value="same"{% if ride and ride.performance == 'same' %} selected{% endif %}>About the same</option>
+        <option value="worse"{% if ride and ride.performance == 'worse' %} selected{% endif %}>Worse</option>
+      </select></label>
+    {% endmacro %}
+    {% macro ride_action(ride) %}
+      {% if ride.status == 'planned' %}
+      <form action="{{ url_for('complete_ride', ride_id=ride.id) }}" method="post" class="ride-feedback">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% if ride.ride_date <= today %}
+        <label>Actual duration <span>minutes · optional</span><input type="number" name="actual_minutes" min="1" max="1440" step="1"></label>
+        {{ rating_fields() }}
+        <p class="hint">Enter actual duration with feedback, or add it later.</p>
+        {% endif %}
+        <button class="secondary" type="submit">Mark completed</button>
+      </form>
+      {% elif ride.ride_date <= today %}
+      <details class="feedback-details"><summary>Add / edit ride feedback</summary>
+        <form action="{{ url_for('update_feedback', ride_id=ride.id) }}" method="post" class="ride-feedback">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>Actual duration <span>minutes</span><input type="number" name="actual_minutes" min="1" max="1440" step="1" required value="{{ ride.actual_minutes if ride.actual_minutes is not none else '' }}"></label>
+          {{ rating_fields(ride) }}
+          <button class="secondary" type="submit">Save feedback</button>
+        </form>
+      </details>
+      {% endif %}
+    {% endmacro %}
 
     <section id="rides" class="section">
       <div class="section-heading"><div><p class="eyebrow">04 / THE JOURNEY</p><h2>Ride log</h2></div><p>Log your efforts and keep track of the journey.</p></div>
@@ -156,6 +216,8 @@
               <label>Power zone <span>optional</span><input name="zone" maxlength="100" placeholder="Zone 2"></label>
             </div>
             <div class="quick-durations" hidden><span>QUICK DURATION</span><button type="button" data-duration="30">30 min</button><button type="button" data-duration="60">60 min</button><button type="button" data-duration="90">90 min</button></div>
+            <p class="hint">For completed rides, duration is the actual time. Feedback is available for rides on or before today.</p>
+            <details class="feedback-details"><summary>Add completed-ride feedback</summary>{{ rating_fields() }}</details>
             <label>Notes <span>optional</span><textarea name="notes" maxlength="2000" rows="3" placeholder="How did it feel?"></textarea></label>
             <p class="live-tip" id="ride-preview" hidden aria-live="polite"></p>
             <button type="submit">Add ride <span>↗</span></button>
@@ -168,12 +230,9 @@
               <div class="entry-top"><span class="tag">{{ ride.ride_date }}</span><span class="status {{ ride.status }}">{{ ride.status }}</span></div>
               <h4>{{ ride.title }}</h4>
               <p>{{ ride.duration_minutes }} min{% if ride.zone %} · {{ ride.zone }}{% endif %}{% if ride.event_name %} · {{ ride.event_name }}{% endif %}</p>
+              {% if ride.actual_minutes is not none %}<p>Actual: {{ ride.actual_minutes }} min{% if ride.effort is not none %} · effort {{ ride.effort }}/10{% endif %}{% if ride.feeling %} · felt {{ ride.feeling }}{% endif %}{% if ride.performance %} · performance {{ ride.performance }}{% endif %}</p>{% endif %}
               {% if ride.notes %}<p class="preline">{{ ride.notes }}</p>{% endif %}
-              {% if ride.status == 'planned' %}
-              <form action="{{ url_for('complete_ride', ride_id=ride.id) }}" method="post">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button class="secondary" type="submit">Mark completed</button>
-              </form>{% endif %}
+              {{ ride_action(ride) }}
             </article>
           {% else %}<p class="empty">No past rides yet. Your calendar shows today's and upcoming rides.</p>{% endfor %}
         </div>
@@ -208,11 +267,8 @@
                       <summary><span class="calendar-ride-status">{{ ride.status }}</span><strong>{{ ride.title }}</strong><small>{{ ride.duration_minutes }} min{% if ride.zone %} · {{ ride.zone }}{% endif %}</small></summary>
                       {% if ride.event_name %}<p>For {{ ride.event_name }}</p>{% endif %}
                       {% if ride.notes %}<p class="preline">{{ ride.notes }}</p>{% endif %}
-                      {% if ride.status == 'planned' %}
-                      <form action="{{ url_for('complete_ride', ride_id=ride.id) }}" method="post">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                        <button class="secondary" type="submit">Mark completed</button>
-                      </form>{% endif %}
+                      {% if ride.actual_minutes is not none %}<p>Actual: {{ ride.actual_minutes }} min{% if ride.effort is not none %} · effort {{ ride.effort }}/10{% endif %}{% if ride.feeling %} · felt {{ ride.feeling }}{% endif %}{% if ride.performance %} · performance {{ ride.performance }}{% endif %}</p>{% endif %}
+                      {{ ride_action(ride) }}
                     </details>
                     {% endfor %}
                   </td>

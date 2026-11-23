@@ -4,13 +4,15 @@ import calendar
 import os
 import secrets
 from collections import defaultdict
-from datetime import date
+from dataclasses import replace
+from datetime import date, timedelta
+from math import floor
 from pathlib import Path
 
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 
 from .db import close_db, get_db, init_db
-from .training import estimate_ftp_from_zone2, make_plan, power_zones
+from .training import RideFeedback, assess_training, estimate_ftp_from_zone2, make_plan, power_zones
 
 
 def create_app(test_config=None):
@@ -64,6 +66,105 @@ def create_app(test_config=None):
         except ValueError:
             raise ValueError(f"Enter a valid {label}.") from None
 
+    def feedback_input(required=False, default_actual=None):
+        actual = number("actual_minutes", "Actual duration", 1, 1440, integer=True, required=required)
+        if actual is None:
+            actual = default_actual
+        effort = number("effort", "Effort", 1, 10, integer=True, required=False)
+        feeling = request.form.get("feeling", "").strip()
+        performance = request.form.get("performance", "").strip()
+        if feeling not in ("", "good", "okay", "poor") or performance not in ("", "better", "same", "worse"):
+            raise ValueError("Choose valid ride feedback.")
+        if actual is None and (effort is not None or feeling or performance):
+            raise ValueError("Enter actual duration with ride feedback.")
+        return actual, feeling or None, effort, performance or None
+
+    def save_feedback(db, ride_id, feedback):
+        db.execute(
+            "INSERT INTO ride_feedback (ride_id, actual_minutes, feeling, effort, performance) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(ride_id) DO UPDATE SET actual_minutes=excluded.actual_minutes, feeling=excluded.feeling, "
+            "effort=excluded.effort, performance=excluded.performance",
+            (ride_id, *feedback),
+        )
+
+    def refresh_active_plans(db, today):
+        profile = db.execute("SELECT * FROM profile WHERE id = 1").fetchone()
+        events = db.execute(
+            "SELECT events.* FROM events JOIN active_plans ON events.id=active_plans.event_id "
+            "WHERE event_date > ? ORDER BY event_date, events.id", (today.isoformat(),)
+        ).fetchall()
+        if not profile or not events:
+            return {}
+        feedback = db.execute(
+            "SELECT rides.ride_date, ride_feedback.* FROM ride_feedback JOIN rides ON rides.id=ride_feedback.ride_id "
+            "WHERE rides.status='completed' AND rides.ride_date BETWEEN ? AND ?",
+            ((today - timedelta(days=13)).isoformat(), today.isoformat()),
+        ).fetchall()
+        observations = [RideFeedback(date.fromisoformat(r["ride_date"]), r["actual_minutes"],
+                                     r["feeling"], r["effort"], r["performance"]) for r in feedback]
+        checkin = db.execute(
+            "SELECT * FROM checkins WHERE checkin_date <= ? ORDER BY checkin_date DESC LIMIT 1", (today.isoformat(),)
+        ).fetchone()
+        latest = (date.fromisoformat(checkin["checkin_date"]), checkin["feeling"]) if checkin else None
+        has_history = db.execute(
+            "SELECT 1 FROM ride_feedback JOIN rides ON rides.id=ride_feedback.ride_id "
+            "WHERE rides.status='completed' AND rides.ride_date <= ? LIMIT 1", (today.isoformat(),)
+        ).fetchone() is not None
+        adjustment = assess_training(today, profile["hours_per_week"], observations, latest, has_history)
+        budget = adjustment.weekly_minutes if adjustment.weekly_minutes is not None else profile["hours_per_week"] * 60
+        if len(events) > 1:
+            adjustment = replace(adjustment, weekly_minutes=budget / len(events),
+                                 explanation=adjustment.explanation + " The budget is shared across active event plans.")
+        # Reserve time already completed this week and manually planned rides before adding generated sessions.
+        used = defaultdict(int)
+        monday = today - timedelta(days=today.weekday())
+        reserved = db.execute(
+            "SELECT rides.ride_date, COALESCE(ride_feedback.actual_minutes, rides.duration_minutes) AS minutes "
+            "FROM rides LEFT JOIN ride_feedback ON rides.id=ride_feedback.ride_id "
+            "WHERE (rides.status='completed' AND rides.ride_date BETWEEN ? AND ?) "
+            "OR (rides.status='planned' AND rides.generated=0 AND rides.ride_date >= ?)",
+            (monday.isoformat(), today.isoformat(), today.isoformat()),
+        ).fetchall()
+        for ride in reserved:
+            used[date.fromisoformat(ride["ride_date"]).isocalendar()[:2]] += ride["minutes"]
+        result = {}
+        for event in events:
+            completed = {
+                row["ride_date"] for row in db.execute(
+                    "SELECT ride_date FROM rides WHERE event_id=? AND generated=1 AND status='completed'", (event["id"],)
+                )
+            }
+            candidates = make_plan(date.fromisoformat(event["event_date"]), today, profile["hours_per_week"],
+                                   event["distance_km"], adjustment)
+            db.execute("DELETE FROM rides WHERE event_id=? AND generated=1 AND status='planned' AND ride_date >= ?",
+                       (event["id"], today.isoformat()))
+            sessions = []
+            for item in candidates:
+                if item["date"] in completed:
+                    continue
+                week = date.fromisoformat(item["date"]).isocalendar()[:2]
+                remaining = floor((budget - used[week]) / 5) * 5
+                item["duration_minutes"] = min(item["duration_minutes"], remaining)
+                if item["duration_minutes"] < 15:
+                    continue
+                if item["title"] == "Tempo intervals" and item["duration_minutes"] < 40:
+                    item.update(title="Easy endurance", zone="Zone 2",
+                                notes="Keep the effort easy; shorten or skip if fatigued.")
+                used[week] += item["duration_minutes"]
+                sessions.append(item)
+            db.executemany(
+                "INSERT INTO rides (ride_date, title, status, duration_minutes, zone, notes, event_id, generated) "
+                "VALUES (?, ?, 'planned', ?, ?, ?, ?, 1)",
+                [(s["date"], s["title"], s["duration_minutes"], s["zone"], s["notes"], event["id"]) for s in sessions],
+            )
+            explanation = adjustment.explanation
+            if not sessions and not adjustment.paused:
+                explanation += " No sessions fit the available budget or remaining dates."
+            db.execute("UPDATE active_plans SET explanation=?, updated_on=? WHERE event_id=?",
+                       (explanation, today.isoformat(), event["id"]))
+            result[event["id"]] = (sessions, explanation)
+        return result
+
     @app.get("/")
     def index():
         today = date.today()
@@ -80,11 +181,17 @@ def create_app(test_config=None):
 
         db = get_db()
         profile = db.execute("SELECT * FROM profile WHERE id = 1").fetchone()
-        events = db.execute("SELECT * FROM events ORDER BY event_date, id").fetchall()
-        rides = db.execute(
-            "SELECT rides.*, events.name AS event_name FROM rides "
-            "LEFT JOIN events ON rides.event_id = events.id ORDER BY ride_date, rides.id"
+        events = db.execute(
+            "SELECT events.*, active_plans.explanation AS plan_explanation, active_plans.updated_on AS plan_updated_on FROM events "
+            "LEFT JOIN active_plans ON events.id=active_plans.event_id ORDER BY event_date, events.id"
         ).fetchall()
+        rides = db.execute(
+            "SELECT rides.*, events.name AS event_name, ride_feedback.actual_minutes, ride_feedback.feeling, "
+            "ride_feedback.effort, ride_feedback.performance FROM rides "
+            "LEFT JOIN events ON rides.event_id = events.id LEFT JOIN ride_feedback ON rides.id=ride_feedback.ride_id "
+            "ORDER BY ride_date, rides.id"
+        ).fetchall()
+        checkin = db.execute("SELECT * FROM checkins ORDER BY checkin_date DESC LIMIT 1").fetchone()
         rides_by_date = defaultdict(list)
         events_by_date = defaultdict(list)
         for ride in rides:
@@ -111,7 +218,7 @@ def create_app(test_config=None):
             date(month.year + 1, 1, 1) if month.month == 12 else date(month.year, month.month + 1, 1)
         ).isoformat()[:7]
         return render_template(
-            "index.html", profile=profile, events=events, rides=rides,
+            "index.html", profile=profile, events=events, rides=rides, checkin=checkin,
             past_rides=[ride for ride in rides if ride["ride_date"] < today.isoformat()],
             weeks=weeks, month_title=f"{calendar.month_name[month.month]} {month.year}",
             previous_month=previous, next_month=following, current_month=today.isoformat()[:7],
@@ -154,16 +261,17 @@ def create_app(test_config=None):
                 source = "FTP entered directly"
                 zone2 = None
             db = get_db()
-            db.execute(
-                "INSERT INTO profile (id, height_cm, weight_kg, ftp, ftp_source, zone2, hours_per_week) "
-                "VALUES (1, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET height_cm=excluded.height_cm, "
-                "weight_kg=excluded.weight_kg, ftp=excluded.ftp, ftp_source=excluded.ftp_source, "
-                "zone2=excluded.zone2, hours_per_week=excluded.hours_per_week",
-                (height, weight, ftp, source, zone2, hours),
-            )
-            db.commit()
-            flash("Profile saved. Regenerate an event plan to apply changes to its future sessions.", "success")
+            with db:
+                db.execute(
+                    "INSERT INTO profile (id, height_cm, weight_kg, ftp, ftp_source, zone2, hours_per_week) "
+                    "VALUES (1, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET height_cm=excluded.height_cm, "
+                    "weight_kg=excluded.weight_kg, ftp=excluded.ftp, ftp_source=excluded.ftp_source, "
+                    "zone2=excluded.zone2, hours_per_week=excluded.hours_per_week",
+                    (height, weight, ftp, source, zone2, hours),
+                )
+                refreshed = refresh_active_plans(db, date.today())
+            flash("Profile saved." + (" Active event plans updated." if refreshed else ""), "success")
         except ValueError as exc:
             flash(str(exc), "error")
         return redirect(url_for("index") + "#profile")
@@ -179,13 +287,21 @@ def create_app(test_config=None):
             duration = number("duration_minutes", "Duration", 1, 1440, integer=True)
             zone = text("zone", "Zone", 100, required=False)
             notes = text("notes", "Notes", 2000, required=False)
+            if (status != "completed" or ride_date > date.today()) and any(
+                request.form.get(field, "").strip() for field in ("actual_minutes", "feeling", "effort", "performance")
+            ):
+                raise ValueError("Ride feedback is only available for completed rides on or before today.")
+            feedback = feedback_input(default_actual=duration if status == "completed" and ride_date <= date.today() else None)
             db = get_db()
-            db.execute(
-                "INSERT INTO rides (ride_date, title, status, duration_minutes, zone, notes) VALUES (?, ?, ?, ?, ?, ?)",
-                (ride_date.isoformat(), title, status, duration, zone, notes),
-            )
-            db.commit()
-            flash("Ride added.", "success")
+            with db:
+                cursor = db.execute(
+                    "INSERT INTO rides (ride_date, title, status, duration_minutes, zone, notes) VALUES (?, ?, ?, ?, ?, ?)",
+                    (ride_date.isoformat(), title, status, duration, zone, notes),
+                )
+                if status == "completed" and ride_date <= date.today():
+                    save_feedback(db, cursor.lastrowid, (duration, *feedback[1:]))
+                refreshed = refresh_active_plans(db, date.today())
+            flash("Ride added." + (" Active event plans updated." if refreshed else ""), "success")
             return redirect(url_for("index", month=ride_date.isoformat()[:7]) + "#calendar")
         except ValueError as exc:
             flash(str(exc), "error")
@@ -194,13 +310,60 @@ def create_app(test_config=None):
     @app.post("/rides/<int:ride_id>/complete")
     def complete_ride(ride_id):
         db = get_db()
-        result = db.execute("UPDATE rides SET status = 'completed' WHERE id = ? AND status = 'planned'", (ride_id,))
-        db.commit()
-        if not result.rowcount:
+        ride = db.execute("SELECT * FROM rides WHERE id = ? AND status = 'planned'", (ride_id,)).fetchone()
+        if ride is None:
             abort(404)
-        ride = db.execute("SELECT ride_date FROM rides WHERE id = ?", (ride_id,)).fetchone()
-        flash("Ride marked completed. Its planned duration and notes are retained.", "success")
+        try:
+            feedback = feedback_input()
+            if feedback[0] is not None and ride["ride_date"] > date.today().isoformat():
+                raise ValueError("Ride feedback is only available on or after the ride date.")
+            with db:
+                db.execute("UPDATE rides SET status='completed' WHERE id=?", (ride_id,))
+                if feedback[0] is not None:
+                    save_feedback(db, ride_id, feedback)
+                refreshed = refresh_active_plans(db, date.today())
+            flash("Ride marked completed." + (" Active event plans updated." if refreshed else "") +
+                  (" Add actual ride feedback to inform future adjustments." if feedback[0] is None else ""), "success")
+        except ValueError as exc:
+            flash(str(exc), "error")
         return redirect(url_for("index", month=ride["ride_date"][:7]) + "#calendar")
+
+    @app.post("/rides/<int:ride_id>/feedback")
+    def update_feedback(ride_id):
+        db = get_db()
+        ride = db.execute("SELECT * FROM rides WHERE id=? AND status='completed'", (ride_id,)).fetchone()
+        if ride is None:
+            abort(404)
+        try:
+            if ride["ride_date"] > date.today().isoformat():
+                raise ValueError("Ride feedback is only available on or after the ride date.")
+            feedback = feedback_input(required=True)
+            with db:
+                save_feedback(db, ride_id, feedback)
+                refreshed = refresh_active_plans(db, date.today())
+            flash("Feedback saved." + (" Active event plans updated." if refreshed else ""), "success")
+        except ValueError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("index", month=ride["ride_date"][:7]) + "#calendar")
+
+    @app.post("/checkin")
+    def save_checkin():
+        feeling = request.form.get("readiness", "")
+        if feeling not in ("good", "okay", "tired", "unwell"):
+            flash("Choose how you are feeling today.", "error")
+            return redirect(url_for("index") + "#checkin")
+        db = get_db()
+        with db:
+            db.execute(
+                "INSERT INTO checkins VALUES (?, ?) ON CONFLICT(checkin_date) DO UPDATE SET feeling=excluded.feeling",
+                (date.today().isoformat(), feeling),
+            )
+            refreshed = refresh_active_plans(db, date.today())
+        message = "Check-in saved." + (" Active event plans updated." if refreshed else "")
+        if feeling == "unwell":
+            message += " Training is paused. Seek appropriate advice and update your check-in before resuming."
+        flash(message, "success")
+        return redirect(url_for("index") + "#checkin")
 
     @app.post("/events")
     def add_event():
@@ -237,30 +400,11 @@ def create_app(test_config=None):
         if event_date <= today:
             flash("Plans can only be generated for future events.", "error")
             return redirect(url_for("index") + "#events")
-        completed_dates = {
-            row["ride_date"] for row in db.execute(
-                "SELECT ride_date FROM rides WHERE event_id = ? AND generated = 1 AND status = 'completed'",
-                (event_id,),
-            )
-        }
-        sessions = [
-            item for item in make_plan(event_date, today, profile["hours_per_week"], event["distance_km"])
-            if item["date"] not in completed_dates
-        ]
-        if not sessions:
-            flash("There are no remaining training days to generate before this event.", "error")
-            return redirect(url_for("index") + "#events")
         with db:
-            db.execute(
-                "DELETE FROM rides WHERE event_id = ? AND generated = 1 AND status = 'planned' AND ride_date >= ?",
-                (event_id, today.isoformat()),
-            )
-            db.executemany(
-                "INSERT INTO rides (ride_date, title, status, duration_minutes, zone, notes, event_id, generated) "
-                "VALUES (?, ?, 'planned', ?, ?, ?, ?, 1)",
-                [(s["date"], s["title"], s["duration_minutes"], s["zone"], s["notes"], event_id) for s in sessions],
-            )
-        flash(f"Generated {len(sessions)} sessions for {event['name']}.", "success")
-        return redirect(url_for("index", month=sessions[0]["date"][:7]) + "#calendar")
+            db.execute("INSERT OR IGNORE INTO active_plans (event_id) VALUES (?)", (event_id,))
+            refreshed = refresh_active_plans(db, today)
+        sessions, explanation = refreshed[event_id]
+        flash(f"Generated {len(sessions)} sessions for {event['name']}. {explanation}", "success")
+        return redirect(url_for("index", month=(sessions[0]["date"] if sessions else event["event_date"])[:7]) + "#calendar")
 
     return app
